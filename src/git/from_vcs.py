@@ -22,8 +22,10 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
     version string, meaning we're inside a checked out source tree.
     """
     GITS = ["git"]
+    TAG_PREFIX_REGEX = "*"
     if sys.platform == "win32":
         GITS = ["git.cmd", "git.exe"]
+        TAG_PREFIX_REGEX = r"\*"
 
     _, rc = runner(GITS, ["rev-parse", "--git-dir"], cwd=root,
                    hide_stderr=True)
@@ -36,7 +38,8 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
     # if there isn't one, this yields HEX[-dirty] (no NUM)
     describe_out, rc = runner(GITS, ["describe", "--tags", "--dirty",
                                      "--always", "--long",
-                                     "--match", "%s[[:digit:]]*" % tag_prefix],
+                                     "--match",
+                                     "%s[[:digit:]]%s" % (tag_prefix, TAG_PREFIX_REGEX)],
                               cwd=root)
     # --long was added in git-1.5.5
     if describe_out is None:
@@ -101,7 +104,7 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
         # TAG-NUM-gHEX
         mo = re.search(r'^(.+)-(\d+)-g([0-9a-f]+)$', git_describe)
         if not mo:
-            # unparseable. Maybe git-describe is misbehaving?
+            # unparsable. Maybe git-describe is misbehaving?
             pieces["error"] = ("unable to parse git-describe output: '%s'"
                                % describe_out)
             return pieces
