@@ -1,11 +1,14 @@
 #! /usr/bin/python
 
 import os, sys
+import posixpath
 import shutil
 import tarfile
 import unittest
 import tempfile
-
+import re
+from unittest import mock
+from pathlib import Path
 
 from pkg_resources import parse_version
 
@@ -14,6 +17,14 @@ import common
 from render import render
 from git import from_vcs, from_keywords
 from subprocess_helper import run_command
+
+
+DEFAULT_PYPROJECT = """\
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+"""
+
 
 class ParseGitDescribe(unittest.TestCase):
     def setUp(self):
@@ -24,7 +35,8 @@ class ParseGitDescribe(unittest.TestCase):
     def test_pieces(self):
         def pv(git_describe, do_error=False,
                expect_pieces=False, branch_name="master"):
-            def fake_run_command(exes, args, cwd=None, hide_stderr=None):
+            def fake_run_command(commands, args, cwd=None, verbose=False,
+                                 hide_stderr=False, env=None):
                 if args[0] == "describe":
                     if do_error == "describe":
                         return None, 0
@@ -37,7 +49,7 @@ class ParseGitDescribe(unittest.TestCase):
                     else:
                         return "longlong\n", 0
                 if args[0] == "rev-list":
-                    return "42\n", 0
+                    return ">hashhashhashhashhashhashhashhash\n" * 42, 0
                 if args[0] == "show":
                     if do_error == "show":
                         return "gpg: signature\n12345\n", 0
@@ -358,7 +370,7 @@ VERBOSE = False
 
 class Repo(common.Common, unittest.TestCase):
 
-    # There are three tree states we're interested in:
+    # There are six tree states we're interested in:
     #  S1: sitting on the initial commit, no tags
     #  S2: dirty tree after the initial commit
     #  S3: sitting on the 1.0 tag
@@ -366,12 +378,13 @@ class Repo(common.Common, unittest.TestCase):
     #  S5: making a new commit after 1.0, clean tree
     #  S6: dirtying the tree after the post-1.0 commit
     #
-    # Then we're interested in 5 kinds of trees:
+    # Then we're interested in 6 kinds of trees:
     #  TA: source tree (with .git)
     #  TB: source tree without .git (should get 'unknown')
     #  TC: source tree without .git unpacked into prefixdir
     #  TD: git-archive tarball
-    #  TE: unpacked sdist tarball
+    #  TE: unpacked sdist tarball (python setup.py sdist)
+    #  TF: unpacked sdist tarball (python -m build -s)
     #
     # In three runtime situations:
     #  RA1: setup.py --version
@@ -386,7 +399,7 @@ class Repo(common.Common, unittest.TestCase):
     # or test/demoapp-script-only/)
 
     def test_full(self):
-        self.run_test("test/demoapp", False, ".")
+        self.run_test("test/demoapp", False, ".", False)
 
     def test_script_only(self):
         # This test looks at an application that consists entirely of a
@@ -395,14 +408,20 @@ class Repo(common.Common, unittest.TestCase):
         # anything executable. So of the 3 runtime situations examined by
         # Repo.test_full above, we only care about RB. (RA1 is valid too, but
         # covered by Repo).
-        self.run_test("test/demoapp-script-only", True, ".")
+        self.run_test("test/demoapp-script-only", True, ".", False)
 
     def test_project_in_subdir(self):
         # This test sets of the git repository so that the python project --
         # i.e. setup.py -- is not located in the root directory
-        self.run_test("test/demoapp", False, "project")
+        self.run_test("test/demoapp", False, "project", False)
 
-    def run_test(self, demoapp_dir, script_only, project_sub_dir):
+    def test_no_tag_prefix(self):
+        self.run_test("test/demoapp", False, ".", False, tag_prefix="")
+
+    def test_pyproject(self):
+        self.run_test("test/demoapp-pyproject", False, ".", True)
+
+    def run_test(self, demoapp_dir, script_only, project_sub_dir, pep518, tag_prefix=None):
         # The test dir should live under /tmp/ or /var/ or somewhere that
         # isn't the child of the versioneer repo's .git directory, since that
         # will confuse the tests that check what happens when there is no
@@ -411,7 +430,7 @@ class Repo(common.Common, unittest.TestCase):
         self.testdir = tempfile.mkdtemp()
         if VERBOSE: print("testdir: %s" % (self.testdir,))
         if os.path.exists(self.testdir):
-            shutil.rmtree(self.testdir)
+            self.rmtree(self.testdir)
 
         # Our tests run from a git repo that lives here. All self.git()
         # operations run from this directory unless overridden.
@@ -424,16 +443,49 @@ class Repo(common.Common, unittest.TestCase):
         self.projdir = os.path.join(self.testdir, self.gitdir,
                                     self.project_sub_dir)
 
+        # Extra repository to try to mess with GIT_DIR and check resilience
+        self.extra_git_dir = os.path.join(self.testdir, "extra_git")
+
         os.mkdir(self.testdir)
+        os.mkdir(self.extra_git_dir)
+        self.git("init", workdir=self.extra_git_dir)
 
         shutil.copytree(demoapp_dir, self.projdir)
         setup_cfg_fn = self.project_file("setup.cfg")
-        with open(setup_cfg_fn, "r") as f:
-            setup_cfg = f.read()
-        setup_cfg = setup_cfg.replace("@VCS@", "git")
-        with open(setup_cfg_fn, "w") as f:
-            f.write(setup_cfg)
-        shutil.copyfile("versioneer.py", self.project_file("versioneer.py"))
+        if os.path.exists(setup_cfg_fn):
+            with open(setup_cfg_fn, "r") as f:
+                setup_cfg = f.read()
+            setup_cfg = setup_cfg.replace("@VCS@", "git")
+
+            tag_prefix_regex = "tag_prefix = (.*)"
+            if tag_prefix is None:
+                tag_prefix = re.search(tag_prefix_regex, setup_cfg).group(1)
+            else:
+                setup_cfg = re.sub(tag_prefix_regex, f"tag_prefix = {tag_prefix}", setup_cfg)
+
+            with open(setup_cfg_fn, "w") as f:
+                f.write(setup_cfg)
+
+        if pep518:
+            # Set test versioneer build-system.requires entry to @ file:///<this-repo>
+            # so that `python -m build` picks it up.
+            pyproject_path = Path(self.project_file("pyproject.toml"))
+            versioneer_source_root = Path(__file__).absolute().parent.parent.parent
+            vsr = str(versioneer_source_root).replace("\\", "/")  # For testing on Windows...
+            pyproject_toml = pyproject_path.read_text()
+            pyproject_toml = pyproject_toml.replace("@REPOROOT@", f"file://{vsr}")
+
+            # Update versioneer config
+            pyproject_toml = pyproject_toml.replace("@VCS@", "git")
+            tag_prefix_regex = 'tag_prefix = "(.*)"'
+            if tag_prefix is None:
+                tag_prefix = re.search(tag_prefix_regex, pyproject_toml).group(1)
+            else:
+                pyproject_toml = re.sub(tag_prefix_regex, f'tag_prefix = "{tag_prefix}"', pyproject_toml)
+
+            pyproject_path.write_text(pyproject_toml)
+        else:
+            shutil.copyfile("versioneer.py", self.project_file("versioneer.py"))
         self.git("init")
         self.git("add", "--all")
         self.git("commit", "-m", "comment")
@@ -445,14 +497,16 @@ class Repo(common.Common, unittest.TestCase):
                         workdir=self.testdir)
         self.assertEqual(v, "0+untagged.1.g%s" % full[:7])
 
-        out = self.python("versioneer.py", "setup").splitlines()
-        self.assertEqual(out[0], "creating src/demo/_version.py")
-        if script_only:
-            self.assertEqual(out[1], " src/demo/__init__.py doesn't exist, ok")
+        if pep518:
+            out = self.python("-m", "versioneer", "install", "--no-vendor").splitlines()
         else:
-            self.assertEqual(out[1], " appending to src/demo/__init__.py")
-        self.assertEqual(out[2], " appending 'versioneer.py' to MANIFEST.in")
-        self.assertEqual(out[3], " appending versionfile_source ('src/demo/_version.py') to MANIFEST.in")
+            out = self.python("versioneer.py", "setup").splitlines()
+        self.assertEqual(out[0], "creating src/demo/_version.py")
+        init = os.path.join("src/demo", "__init__.py")
+        if script_only:
+            self.assertEqual(out[1], f" {init} doesn't exist, ok")
+        else:
+            self.assertEqual(out[1], f" appending to {init}")
 
         # Many folks have a ~/.gitignore with ignores .pyc files, but if they
         # don't, it will show up in the status here. Ignore it.
@@ -464,9 +518,8 @@ class Repo(common.Common, unittest.TestCase):
                     ]
         out = set(remove_pyc(self.git("status", "--porcelain").splitlines()))
         def pf(fn):
-            return os.path.normpath(os.path.join(self.project_sub_dir, fn))
+            return posixpath.normpath(posixpath.join(self.project_sub_dir, fn))
         expected = {"A  %s" % pf(".gitattributes"),
-                    "M  %s" % pf("MANIFEST.in"),
                     "A  %s" % pf("src/demo/_version.py"),
                     }
         if not script_only:
@@ -480,14 +533,15 @@ class Repo(common.Common, unittest.TestCase):
         self.git("commit", "-m", "add _version stuff")
 
         # "versioneer.py setup" should be idempotent
-        out = self.python("versioneer.py", "setup").splitlines()
+        if pep518:
+            out = self.python("-m", "versioneer", "install", "--no-vendor").splitlines()
+        else:
+            out = self.python("versioneer.py", "setup").splitlines()
         self.assertEqual(out[0], "creating src/demo/_version.py")
         if script_only:
-            self.assertEqual(out[1], " src/demo/__init__.py doesn't exist, ok")
+            self.assertEqual(out[1], f" {init} doesn't exist, ok")
         else:
-            self.assertEqual(out[1], " src/demo/__init__.py unmodified")
-        self.assertEqual(out[2], " 'versioneer.py' already in MANIFEST.in")
-        self.assertEqual(out[3], " versionfile_source already in MANIFEST.in")
+            self.assertEqual(out[1], f" {init} unmodified")
         out = set(remove_pyc(self.git("status", "--porcelain").splitlines()))
         self.assertEqual(out, set())
 
@@ -502,6 +556,7 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, False, None],
                               "TD": ["0+unknown", full, False, NOTAG],
                               "TE": [short, full, False, None],
+                              "TF": [short, full, False, None],
                               })
 
         # TD: expanded keywords only tell us about tags and full revisionids,
@@ -520,12 +575,13 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, True, None],
                               "TD": ["0+unknown", full, False, NOTAG],
                               "TE": [short, full, True, None],
+                              "TF": [short, full, True, None],
                               })
 
         # S3: we commit that change, then make the first tag (1.0)
         self.git("add", self.project_file("setup.py"))
         self.git("commit", "-m", "dirty")
-        self.git("tag", "demo-1.0")
+        self.git("tag", f"{tag_prefix}1.0")
         # also add an unrelated tag, to test exclusion. git-describe appears
         # to return the highest lexicographically-sorted tag, so make sure
         # the unrelated one sorts earlier
@@ -539,6 +595,7 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, False, None],
                               "TD": [short, full, False, None],
                               "TE": [short, full, False, None],
+                              "TF": [short, full, False, None],
                               })
 
         # S4: now we dirty the tree
@@ -551,6 +608,7 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, True, None],
                               "TD": ["1.0", full, False, None],
                               "TE": [short, full, True, None],
+                              "TF": [short, full, True, None],
                               })
 
         # S5: now we make one commit past the tag
@@ -563,6 +621,7 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, False, None],
                               "TD": ["0+unknown", full, False, NOTAG],
                               "TE": [short, full, False, None],
+                              "TF": [short, full, False, None],
                               })
 
         # S6: dirty the post-tag tree
@@ -575,27 +634,32 @@ class Repo(common.Common, unittest.TestCase):
                               "TC": [short, full, True, None],
                               "TD": ["0+unknown", full, False, NOTAG],
                               "TE": [short, full, True, None],
+                              "TF": [short, full, True, None],
                               })
 
 
     def do_checks(self, state, exps):
         if os.path.exists(self.subpath("out")):
-            shutil.rmtree(self.subpath("out"))
+            self.rmtree(self.subpath("out"))
         # TA: project tree
         self.check_version(self.projdir, state, "TA", exps["TA"])
+        # TA2: GIT_DIR has no effect when in git repository
+        GIT_DIR = os.path.join(self.extra_git_dir, ".git")
+        with mock.patch.dict(os.environ, {"GIT_DIR": GIT_DIR}):
+            self.check_version(self.projdir, state, "TA", exps["TA"])
 
         # TB: .git-less copy of project tree
         target = self.subpath("out/demoapp-TB")
         shutil.copytree(self.projdir, target)
         if os.path.exists(os.path.join(target, ".git")):
-            shutil.rmtree(os.path.join(target, ".git"))
+            self.rmtree(os.path.join(target, ".git"))
         self.check_version(target, state, "TB", exps["TB"])
 
         # TC: project tree in versionprefix-named parentdir
         target = self.subpath("out/demo-1.1")
         shutil.copytree(self.projdir, target)
         if os.path.exists(os.path.join(target, ".git")):
-            shutil.rmtree(os.path.join(target, ".git"))
+            self.rmtree(os.path.join(target, ".git"))
         self.check_version(target, state, "TC", ["1.1", None, False, None]) # XXX
 
         # TD: project subdir of an unpacked git-archive tarball
@@ -611,7 +675,7 @@ class Repo(common.Common, unittest.TestCase):
         # TE: unpacked setup.py sdist tarball
         dist_path = os.path.join(self.projdir, "dist")
         if os.path.exists(dist_path):
-            shutil.rmtree(dist_path)
+            self.rmtree(dist_path)
         self.python("setup.py", "sdist", "--formats=tar")
         files = os.listdir(dist_path)
         self.assertTrue(len(files)==1, files)
@@ -624,6 +688,30 @@ class Repo(common.Common, unittest.TestCase):
         target = self.subpath("out/TE/demo-%s" % exps["TE"][0])
         self.assertTrue(os.path.isdir(target))
         self.check_version(target, state, "TE", exps["TE"])
+
+        # TF: unpacked python -m build --sdist tarball
+        pyproject_path = Path(self.projdir) / "pyproject.toml"
+        if not pyproject_path.exists():
+            return
+        dist_path = Path(self.projdir) / "dist"
+        if dist_path.exists():
+            self.rmtree(dist_path)
+        # --no-isolation makes this less finicky on slow/unreliable network
+        # connections at the cost of being potentially less "normal".
+        # We'll rely on Tox and CI to keep this environment isolated and
+        # fresh.
+        self.python("-m", "build", "--sdist", "--no-isolation")
+        files = os.listdir(dist_path)
+        self.assertTrue(len(files)==1, files)
+        distfile = files[0]
+        self.assertEqual(distfile, "demo-%s.tar.gz" % exps["TF"][0])
+        fn = os.path.join(dist_path, distfile)
+        os.mkdir(self.subpath("out/TF"))
+        with tarfile.open(fn) as t:
+            t.extractall(path=self.subpath("out/TF"))
+        target = self.subpath("out/TF/demo-%s" % exps["TF"][0])
+        self.assertTrue(os.path.isdir(target))
+        self.check_version(target, state, "TF", exps["TF"])
 
     def check_version(self, workdir, state, tree, exps):
         exp_version, exp_full, exp_dirty, exp_error = exps
@@ -646,7 +734,7 @@ class Repo(common.Common, unittest.TestCase):
 
         # RB: setup.py build; rundemo --version
         if os.path.exists(os.path.join(workdir, "build")):
-            shutil.rmtree(os.path.join(workdir, "build"))
+            self.rmtree(os.path.join(workdir, "build"))
         self.python("setup.py", "build", "--build-lib=build/lib",
                     "--build-scripts=build/lib", workdir=workdir)
         build_lib = os.path.join(workdir, "build", "lib")

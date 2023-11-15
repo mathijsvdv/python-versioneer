@@ -1,20 +1,19 @@
 import sys  # --STRIP DURING BUILD
 import re  # --STRIP DURING BUILD
+import os  # --STRIP DURING BUILD
+import functools  # --STRIP DURING BUILD
+from typing import Any, Callable, Dict  # --STRIP DURING BUILD
+from .long_header import NotThisMethod, register_vcs_handler  # --STRIP DURING BUILD
+from subprocess_helper import run_command  # --STRIP DURING BUILD
   # --STRIP DURING BUILD
   # --STRIP DURING BUILD
-def register_vcs_handler(*args):  # --STRIP DURING BUILD
-    def nil(f):  # --STRIP DURING BUILD
-        return f  # --STRIP DURING BUILD
-    return nil  # --STRIP DURING BUILD
-  # --STRIP DURING BUILD
-  # --STRIP DURING BUILD
-def run_command(): pass  # --STRIP DURING BUILD
-  # --STRIP DURING BUILD
-  # --STRIP DURING BUILD
-class NotThisMethod(Exception):  # --STRIP DURING BUILD
-    pass  # --STRIP DURING BUILD
 @register_vcs_handler("git", "pieces_from_vcs")
-def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
+def git_pieces_from_vcs(
+    tag_prefix: str,
+    root: str,
+    verbose: bool,
+    runner: Callable = run_command
+) -> Dict[str, Any]:
     """Get version from 'git describe' in the root of the source tree.
 
     This only gets called if the git-archive 'subst' keywords were *not*
@@ -22,13 +21,18 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
     version string, meaning we're inside a checked out source tree.
     """
     GITS = ["git"]
-    TAG_PREFIX_REGEX = "*"
     if sys.platform == "win32":
         GITS = ["git.cmd", "git.exe"]
-        TAG_PREFIX_REGEX = r"\*"
+
+    # GIT_DIR can interfere with correct operation of Versioneer.
+    # It may be intended to be passed to the Versioneer-versioned project,
+    # but that should not change where we get our version from.
+    env = os.environ.copy()
+    env.pop("GIT_DIR", None)
+    runner = functools.partial(runner, env=env)
 
     _, rc = runner(GITS, ["rev-parse", "--git-dir"], cwd=root,
-                   hide_stderr=True)
+                   hide_stderr=not verbose)
     if rc != 0:
         if verbose:
             print("Directory %s not under git control" % root)
@@ -36,11 +40,10 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
 
     # if there is a tag matching tag_prefix, this yields TAG-NUM-gHEX[-dirty]
     # if there isn't one, this yields HEX[-dirty] (no NUM)
-    describe_out, rc = runner(GITS, ["describe", "--tags", "--dirty",
-                                     "--always", "--long",
-                                     "--match",
-                                     "%s%s" % (tag_prefix, TAG_PREFIX_REGEX)],
-                              cwd=root)
+    describe_out, rc = runner(GITS, [
+        "describe", "--tags", "--dirty", "--always", "--long",
+        "--match", f"{tag_prefix}[[:digit:]]*"
+    ], cwd=root)
     # --long was added in git-1.5.5
     if describe_out is None:
         raise NotThisMethod("'git describe' failed")
@@ -50,7 +53,7 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
         raise NotThisMethod("'git rev-parse' failed")
     full_out = full_out.strip()
 
-    pieces = {}
+    pieces: Dict[str, Any] = {}
     pieces["long"] = full_out
     pieces["short"] = full_out[:7]  # maybe improved later
     pieces["error"] = None
@@ -129,8 +132,8 @@ def git_pieces_from_vcs(tag_prefix, root, verbose, runner=run_command):
     else:
         # HEX: no tags
         pieces["closest-tag"] = None
-        count_out, rc = runner(GITS, ["rev-list", "HEAD", "--count"], cwd=root)
-        pieces["distance"] = int(count_out)  # total number of commits
+        out, rc = runner(GITS, ["rev-list", "HEAD", "--left-right"], cwd=root)
+        pieces["distance"] = len(out.split())  # total number of commits
 
     # commit date: see ISO-8601 comment in git_versions_from_keywords()
     date = runner(GITS, ["show", "-s", "--format=%ci", "HEAD"], cwd=root)[0].strip()

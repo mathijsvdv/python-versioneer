@@ -15,12 +15,12 @@ def get_versions():
     return json.loads(version_json)
 """
 
-import os # --STRIP DURING BUILD
 import json # --STRIP DURING BUILD
 import re # --STRIP DURING BUILD
-class NotThisMethod(Exception): pass  # --STRIP DURING BUILD
+from typing import Any, Dict # --STRIP DURING BUILD
+from .header import NotThisMethod # --STRIP DURING BUILD
 
-def versions_from_file(filename):
+def versions_from_file(filename: str) -> Dict[str, Any]:
     """Try to determine the version from _version.py if present."""
     try:
         with open(filename) as f:
@@ -37,9 +37,8 @@ def versions_from_file(filename):
     return json.loads(mo.group(1))
 
 
-def write_to_version_file(filename, versions):
+def write_to_version_file(filename: str, versions: Dict[str, Any]) -> None:
     """Write the given version number to the given _version.py file."""
-    os.unlink(filename)
     contents = json.dumps(versions, sort_keys=True,
                           indent=1, separators=(",", ": "))
     with open(filename, "w") as f:

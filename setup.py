@@ -1,21 +1,29 @@
 #!/usr/bin/env python
 
 import os, base64, tempfile, io
+from importlib import util as ilu
 from pathlib import Path
+from typing import List, Tuple
 from setuptools import setup, Command
 from setuptools.command.build_py import build_py
-from setuptools.dist import Distribution as _Distribution
+from setuptools.command.develop import develop as _develop
 
-LONG = Path.read_text(Path(__file__).parent / "README.md")
+# If versioneer is not installed in the environment, then we will need to
+# need to build and exec it. The build requires a VERSION, so we might need
+# this before we know its value.
+VERSION = "0+bootstrap"
 
-# as nice as it'd be to versioneer ourselves, that sounds messy.
-VERSION = "0.22.dev0"
 
-
-def ver(s):
+def ver(s: str) -> str:
     return s.replace("@VERSIONEER-VERSION@", VERSION)
 
-def get(fn, add_ver=False, unquote=False, do_strip=False, do_readme=False):
+def get(
+    fn: str,
+    add_ver: bool = False,
+    unquote: bool = False,
+    do_strip: bool = False,
+    do_readme: bool = False
+) -> str:
     with open(fn) as f:
         text = f.read()
 
@@ -30,14 +38,14 @@ def get(fn, add_ver=False, unquote=False, do_strip=False, do_readme=False):
         text = text.replace("@README@", get("README.md"))
     return text
 
-def get_vcs_list():
+def get_vcs_list() -> List[str]:
     project_path = Path(__file__).absolute().parent / "src"
     return [filename
             for filename
             in os.listdir(str(project_path))
             if Path.is_dir(project_path / filename) and filename != "__pycache__"]
 
-def generate_long_version_py(VCS):
+def generate_long_version_py(VCS: str) -> str:
     s = io.StringIO()
     s.write(get(f"src/{VCS}/long_header.py", add_ver=True, do_strip=True))
     for piece in ["src/subprocess_helper.py",
@@ -49,9 +57,9 @@ def generate_long_version_py(VCS):
         s.write(get(piece, unquote=True, do_strip=True))
     return s.getvalue()
 
-def generate_versioneer_py():
+def generate_versioneer_py() -> bytes:
     s = io.StringIO()
-    s.write(get("src/header.py", add_ver=True, do_readme=True))
+    s.write(get("src/header.py", add_ver=True, do_readme=True, do_strip=True))
     s.write(get("src/subprocess_helper.py", do_strip=True))
 
     for VCS in get_vcs_list():
@@ -77,26 +85,25 @@ def generate_versioneer_py():
 
 class make_versioneer(Command):
     description = "create standalone versioneer.py"
-    user_options = []
-    boolean_options = []
-    def initialize_options(self):
+    user_options: List[Tuple[str, str, str]] = []
+    boolean_options: List[str] = []
+    def initialize_options(self) -> None:
         pass
-    def finalize_options(self):
+    def finalize_options(self) -> None:
         pass
-    def run(self):
+    def run(self) -> None:
         with open("versioneer.py", "w") as f:
             f.write(generate_versioneer_py().decode("utf8"))
-        return 0
 
 class make_long_version_py_git(Command):
     description = "create standalone _version.py (for git)"
-    user_options = []
-    boolean_options = []
-    def initialize_options(self):
+    user_options: List[Tuple[str, str, str]] = []
+    boolean_options: List[str] = []
+    def initialize_options(self) -> None:
         pass
-    def finalize_options(self):
+    def finalize_options(self) -> None:
         pass
-    def run(self):
+    def run(self) -> None:
         assert os.path.exists("versioneer.py")
         long_version = generate_long_version_py("git")
         with open("git_version.py", "w") as f:
@@ -107,68 +114,46 @@ class make_long_version_py_git(Command):
                      "PARENTDIR_PREFIX": "parentdir_prefix",
                      "VERSIONFILE_SOURCE": "versionfile_source",
                      })
-        return 0
 
 class my_build_py(build_py):
-    def run(self):
+    def run(self) -> None:
         v = generate_versioneer_py()
         v_b64 = base64.b64encode(v).decode("ascii")
         lines = [v_b64[i:i+60] for i in range(0, len(v_b64), 60)]
         v_b64 = "\n".join(lines)+"\n"
 
-        with open("src/installer.py") as f:
-            s = f.read()
+        s = Path("src/installer.py").read_text()
         s = ver(s.replace("@VERSIONEER-INSTALLER@", v_b64))
-
         with tempfile.TemporaryDirectory() as tempdir:
-            installer = os.path.join(tempdir, "versioneer.py")
-            with open(installer, "w") as f:
-                f.write(s)
+            installer = Path(tempdir) / "versioneer.py"
+            installer.write_text(s)
 
-            self.py_modules = [os.path.splitext(os.path.basename(installer))[0]]
-            self.package_dir.update({'': os.path.dirname(installer)})
-            rc = build_py.run(self)
-        return rc
+            self.package_dir.update({'': os.path.relpath(installer.parent)})
+            build_py.run(self)
 
+# The structure of versioneer, with its components that are compiled into a single file,
+# makes it unsuitable for development mode.
+class develop(_develop):
+    def run(self) -> None:  # type: ignore[override]
+        raise RuntimeError("Versioneer cannot be installed in developer/editable mode.")
 
-# python's distutils treats module-less packages as binary-specific (not
-# "pure"), so "setup.py bdist_wheel" creates binary-specific wheels. Override
-# this so we get cross-platform wheels instead. More info at:
-# https://bitbucket.org/pypa/wheel/issue/116/packages-with-only-filesdata_files-get
-class Distribution(_Distribution):
-    def is_pure(self): return True
+# Bootstrap a versioneer module to guarantee that we get a compatible version
+versioneer = ilu.module_from_spec(
+    ilu.spec_from_loader('versioneer', loader=None)  # type: ignore[arg-type]
+)
+exec(generate_versioneer_py(), versioneer.__dict__)
+
+VERSION = versioneer.get_version()
+
 
 setup(
-    name = "versioneer",
-    license = "public domain",
-    version = VERSION,
-    description = "Easy VCS-based management of project version strings",
-    author = "Brian Warner",
-    author_email = "warner-versioneer@lothar.com",
-    url = "https://github.com/python-versioneer/python-versioneer",
-    # "fake" is replaced with versioneer-installer in build_scripts. We need
-    # a non-empty list to provoke "setup.py build" into making scripts,
-    # otherwise it skips that step.
-    py_modules = ["fake"],
-    entry_points={
-        'console_scripts': [
-            'versioneer = versioneer:main',
-        ],
-    },
-    long_description=LONG,
-    long_description_content_type="text/markdown",
-    distclass=Distribution,
-    cmdclass = { "build_py": my_build_py,
-                 "make_versioneer": make_versioneer,
-                 "make_long_version_py_git": make_long_version_py_git,
-                 },
-    python_requires=">=3.6",
-    classifiers=[
-        "Programming Language :: Python",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        ],
-    )
+    name="versioneer",  # need by GitHub dependency graph
+    version=VERSION,
+    py_modules=["versioneer"],
+    cmdclass=versioneer.get_cmdclass({
+        "build_py": my_build_py,
+        "make_versioneer": make_versioneer,
+        "make_long_version_py_git": make_long_version_py_git,
+        "develop": develop,
+    })
+)
